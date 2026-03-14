@@ -24,3 +24,6 @@ mydb.exe
 # 测试文件（根据需要决定是否忽略）
 test.db
 *.db
+db_test.py
+__pycache__/
+*.py
