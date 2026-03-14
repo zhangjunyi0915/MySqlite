@@ -1,0 +1,26 @@
+# 可执行文件
+*.exe
+*.out
+*.app
+mydb
+mydb.exe
+
+# 编译生成的文件
+*.o
+*.obj
+*.dSYM/
+
+# IDE 配置文件（如果你不想上传这些）
+.vscode/
+.vs/
+*.swp
+*.swo
+
+# 临时文件
+*~
+*.log
+*.tmp
+
+# 测试文件（根据需要决定是否忽略）
+test.db
+*.db
