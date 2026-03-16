@@ -4,6 +4,9 @@
 #include <string.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 
 typedef struct{
@@ -86,44 +89,159 @@ void deserialize_row(void* source, Row* destinantion){
 const uint32_t ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
 const uint32_t TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
 
+
+//Pager负责管理页，它可以从磁盘读取页也可以向磁盘写入页
+typedef struct{
+    FILE* file_descriptor;    //文件指针
+    uint32_t file_length;      //文件长度
+    void* pages[TABLE_MAX_PAGES];  //内存中的页指针数组
+}Pager;
+
 //表结构体
 typedef struct{
     uint32_t num_rows; //表中当前的行数
-    void* pages[TABLE_MAX_PAGES]; //指向页的指针数组，每个页都是一个连续的内存块
+    Pager* pager;
 }Table;
+
+
+
+
+//打开数据库文件并初始化Pager
+Pager* pager_open(const char* filename){
+    FILE* file_descriptor = fopen(filename, "rb+");
+    // O_RDWR: 读写模式 | O_CREAT: 文件不存在则创建
+    // S_IWUSR: 用户可写 | S_IRUSR: 用户可读
+    if(file_descriptor == NULL){
+        // 如果文件打开失败（比如不存在），就以写模式创建一个新文件
+        file_descriptor = fopen(filename, "wb+");
+        if(file_descriptor == NULL){
+            printf("Unable to open file %s\n", filename);
+            exit(EXIT_FAILURE);
+        }
+
+    }
+    //获取文件的大小
+    //SEEK_END: 从文件末尾开始计算偏移量，0表示文件末尾
+    //SEEK_SET: 从文件开头开始计算偏移量，0表示文件开头
+    fseek(file_descriptor, 0, SEEK_END);
+    uint32_t file_length = ftell(file_descriptor);  // 返回当前距离文件开头的字节数
+    Pager* pager = (Pager*)malloc(sizeof(Pager));
+    pager->file_descriptor = file_descriptor;
+    pager->file_length = file_length;
+    for(int i = 0; i < TABLE_MAX_PAGES; i++){
+        pager->pages[i] = NULL;
+    }
+
+    return pager;
+}
+
+//获取指定页面，如果页面不在缓存区就从磁盘读取
+void* get_page(Pager* pager, uint32_t page_num){
+    if(page_num > TABLE_MAX_PAGES){
+        printf("tried to fecth page number out of bounds, %d > %d \n", page_num, TABLE_MAX_PAGES);
+        exit(EXIT_FAILURE);
+    }
+    //如果缓存中没有这一页需要从磁盘中加载
+    if(pager->pages[page_num] == NULL){
+        //分配4KB的内存来存储这一页
+        void* page = pager->pages[page_num] = malloc(PAGE_SIZE);
+        //计算文件中的完整页数
+        uint32_t num_pages = pager->file_length / PAGE_SIZE;
+        if(pager->file_length % PAGE_SIZE){
+            num_pages +=1;
+        }
+
+        if(page_num < num_pages){
+            //请求页在文件范围内，从文件中读取
+            fseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
+            size_t bytes_read = fread(page, PAGE_SIZE, 1, pager->file_descriptor);
+            if(bytes_read == -1){
+                printf("Error reading file: %d\n", errno);
+                exit(EXIT_FAILURE);
+            }
+        }else{
+            //请求页在文件范围外，初始化为0
+            memset(page, 0, PAGE_SIZE);
+        }
+        //将新加载的页存入缓存
+        pager->pages[page_num] = page;
+    }
+
+    return pager->pages[page_num];
+
+}
+
+//将指定页刷到磁盘
+void* pager_flush(Pager* pager, uint32_t page_num, uint32_t size){
+    if(pager->pages[page_num] == NULL){
+        printf("Tried to flush null page\n");
+        exit(EXIT_FAILURE);
+    }
+    //定位到文件中该页的起始位置
+    fseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
+    size_t bytes_written = fwrite(pager->pages[page_num], size, 1, pager->file_descriptor);
+    if(bytes_written == -1){
+        printf("Error writing to file: %d\n", errno);
+        exit(EXIT_FAILURE);
+    }
+}
+
+//打开数据库（初始化table和pager）
+Table* db_open(const char* filename){
+    Pager* pager = pager_open(filename);
+    uint32_t num_rows = pager->file_length / ROW_SIZE;
+    Table* table = (Table*)malloc(sizeof(Table));
+    table->pager = pager;
+    table->num_rows = num_rows;
+    return table;
+}
+
+//关闭数据库，释放资源
+void db_close(Table* table){
+    Pager* pager = table->pager;
+    uint32_t num_full_pages = table->num_rows / ROWS_PER_PAGE;
+    //将所有完整的页刷到磁盘
+    for(int i = 0; i < num_full_pages; i++){
+        if(pager->pages[i] == NULL){
+            continue;
+        }
+        pager_flush(pager, i, PAGE_SIZE);
+    }
+    //处理最后一页，可能不满
+    uint32_t num_additional_rows = table->num_rows % ROWS_PER_PAGE;
+    if(num_additional_rows > 0){
+        if(pager->pages[num_full_pages] != NULL){
+            pager_flush(pager, num_full_pages, num_additional_rows * ROW_SIZE);
+        }
+    
+    }
+    //关闭文件和释放pager和Table内存
+    int result = fclose(pager->file_descriptor);
+    if(result == -1){
+        printf("Error cloing file.\n");
+        exit(EXIT_FAILURE);
+    }
+    for(int i = 0; i < TABLE_MAX_PAGES; i++){
+        void* page = pager->pages[i];
+        if (page) {
+            free(page);
+            pager->pages[i] = NULL;
+        }
+        
+    }
+    free(pager);
+    free(table);
+}
 
 //计算某一行的具体地址
 //根据行号返回其在那个页的哪个位置的指针
 void* row_slot(Table* table, uint32_t row_num){
     uint32_t page_num = row_num / ROWS_PER_PAGE;
-    void* page = table->pages[page_num];
-    if(page == NULL){
-        page = table->pages[page_num] = malloc(PAGE_SIZE);
-    }
+    void* page = get_page(table->pager, page_num);
     uint32_t row_offset = row_num % ROWS_PER_PAGE;
     uint32_t byte_offset = row_offset * ROW_SIZE;
     return page + byte_offset;
 }
-
-//初始化表
-Table* new_table(){
-    Table* table = (Table*)malloc(sizeof(Table));
-    table->num_rows = 0;
-    for(int i = 0; i<TABLE_MAX_PAGES; i++){
-        table->pages[i] = NULL;
-    }
-    return table;
-}
-
-//释放表所占的内存
-void free_table(Table* table){
-    for(int i = 0; i<TABLE_MAX_PAGES; i++){
-        free(table->pages[i]);
-    }
-    free(table);
-}
-
-
 
 
 //定义状态吗
@@ -165,7 +283,7 @@ typedef struct{
 MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table){
     if(strcmp(input_buffer->buffer, ".exit") == 0){
         close_input_buffer(input_buffer);
-        free_table(table);    //退出前释放表内存
+        db_close(table);    //退出前释放表内存
         exit(EXIT_SUCCESS);
     }else{
         return META_COMMAND_UNRECOGNIZED_COMMAND;
@@ -259,8 +377,13 @@ ExecuteResult execute_statement(Statement* statement, Table* table){
 
 
 int main(int argc, char *argv[]){
-    // 初始化一个表
-    Table* table = new_table();
+    // 运行程序时需要指定数据库文件名
+    if(argc < 2){
+        printf("Must supply a database filename.\n");
+        exit(EXIT_FAILURE);
+    }
+    char* filename = argv[1];
+    Table* table = db_open(filename);
     InputBuffer* input_buffer = new_input_buffer();
 
     // // ========== 添加调试信息打印 ==========
