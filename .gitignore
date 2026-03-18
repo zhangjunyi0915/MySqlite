@@ -6,6 +6,7 @@ mydb
 mydb.exe
 
 # 编译生成的文件
+main
 *.o
 *.obj
 *.dSYM/
