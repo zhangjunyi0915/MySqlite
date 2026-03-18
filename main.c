@@ -159,14 +159,14 @@ void* leaf_node_value(void* node, uint32_t cell_num){
 
 // 获取节点类型
 NodeType get_node_type(void* node){
-    uint8_t value = *((uint32_t*)(node + NODE_TYPE_OFFSET));
+    uint8_t value = *((uint8_t*)(node + NODE_TYPE_OFFSET));
     return (NodeType)value;
 }
 
 //设置节点的类型
 void set_node_type(void* node, NodeType type){
-    uint32_t value = type;
-    *((uint32_t*)(node + NODE_TYPE_OFFSET)) = value;
+    uint8_t value = type;
+    *((uint8_t*)(node + NODE_TYPE_OFFSET)) = value;
 }
 
 //初始化一个叶子节点
@@ -247,11 +247,16 @@ void leaf_node_insert(Cursor* cursor, uint32_t key, Row* value){
         printf("Error: Leaf node full.\n");
         exit(EXIT_FAILURE);
     }
-    if(cursor->cell_num < num_cells){
-        //需要为新单元腾出空间，移动现有单元
-        for(uint32_t i = num_cells; i > cursor->cell_num; i--){
-            memcpy(leaf_node_cell(node, i), leaf_node_cell(node, i - 1), LEAF_NODE_CELL_SIZE);
-        }
+    uint32_t cursor_cell_num = cursor->cell_num;
+    /* 重要：如果插入点不在末尾，需要挪位置 */
+    if (cursor_cell_num < num_cells) {
+        // 将 cursor_cell_num 之后的所有 cell 向后移动一位,目标地址：当前 cell + 1 的起始位置,源地址：当前 cell 的起始位置
+        // 长度：剩余 cell 的总大小
+        memmove(
+            leaf_node_cell(node, cursor_cell_num + 1),
+            leaf_node_cell(node, cursor_cell_num),
+            (num_cells - cursor_cell_num) * LEAF_NODE_CELL_SIZE
+        );
     }
     //插入新的单元
     *leaf_node_num_cells(node) += 1;
@@ -259,7 +264,45 @@ void leaf_node_insert(Cursor* cursor, uint32_t key, Row* value){
     serialize_row(value, leaf_node_value(node, cursor->cell_num));
 }
 
+//在叶子节点中找到key的位置，如果找到返回true并把cell_num设置为key所在的单元格位置，如果没找到返回false并把cell_num设置为应该插入的位置
+Cursor* leaf_node_find(Table* table, uint32_t page_num, uint32_t key){
+    void* node = get_page(table->pager, page_num);
+    uint32_t num_cells = *leaf_node_num_cells(node);
+    Cursor* cursor = (Cursor*)malloc(sizeof(Cursor));
+    cursor->table = table;
+    cursor->page_num = page_num;
+    //二分查找实现
+    uint32_t min_index = 0;
+    uint32_t one_past_max_index = num_cells;
+    while(one_past_max_index != min_index){
+        uint32_t index = (min_index + one_past_max_index) / 2;
+        uint32_t key_at_index = *leaf_node_key(node, index);
+        if(key == key_at_index){
+            cursor->cell_num = index;
+            return cursor;
+        }
+        if(key < key_at_index){
+            one_past_max_index = index;
+        }else{
+            min_index = index + 1;
+        }
+    }
+    cursor->cell_num = min_index;
+    return cursor;
+}
 
+//从根节点开始查找特定key
+Cursor* table_find(Table* table, uint32_t key){
+    uint32_t root_page_num = table->root_page_num;
+    void* root_node = get_page(table->pager, root_page_num);
+    if(get_node_type(root_node) == NODE_LEAF){
+        return leaf_node_find(table, root_page_num, key);
+    }else{
+        //之后实现内部节点的查找逻辑
+        printf("Error: Internal node searching not implemented.\n");
+        exit(EXIT_FAILURE);
+    }
+}
 
 //打开数据库文件并初始化Pager
 Pager* pager_open(const char* filename){
@@ -296,7 +339,6 @@ Pager* pager_open(const char* filename){
 }
 
 
-
 //将指定页刷到磁盘
 void* pager_flush(Pager* pager, uint32_t page_num){
     if(pager->pages[page_num] == NULL){
@@ -318,29 +360,20 @@ void* pager_flush(Pager* pager, uint32_t page_num){
 //const uint32_t TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
 //表结构体
 
-
 //创建一个指向表头的游标
 Cursor* table_start(Table* table){
-    Cursor* cursor = (Cursor*)malloc(sizeof(Cursor));
-    cursor->table = table;
-    cursor->page_num = table->root_page_num;
-    cursor->cell_num = 0;
-    void* root_node = get_page(table->pager, table->root_page_num);
+    // 查找 Key 为 0 的位置（即最左侧位置）
+    // Cursor* cursor = (Cursor*)malloc(sizeof(Cursor));
+    // cursor->table = table;
+    // cursor->page_num = table->root_page_num;
+    // cursor->cell_num = 0;
+    Cursor* cursor = table_find(table, 0);
+    void* root_node = get_page(table->pager, cursor->page_num);
     uint32_t num_cells = *leaf_node_num_cells(root_node);
     cursor->end_of_table = (num_cells == 0); //如果根节点没有任何单元格，游标直接指向末尾
     return cursor;
 }
-//创建一个指向表尾的游标
-Cursor* table_end(Table* table){
-    Cursor* cursor = (Cursor*)malloc(sizeof(Cursor));
-    cursor->table = table;
-    cursor->page_num = table->root_page_num;
-    void* root_node = get_page(table->pager, table->root_page_num);
-    uint32_t num_cells = *leaf_node_num_cells(root_node);
-    cursor->cell_num = num_cells; //游标指向最后一个单元格
-    cursor->end_of_table = true; //游标直接指向末尾
-    return cursor;
-}
+
 
 //通过游标获取当前行的地址
 void* cursor_value(Cursor* cursor){
@@ -428,7 +461,8 @@ typedef enum{
 //定义执行结果
 typedef enum{
     EXECUTE_SUCCESS,
-    EXECUTE_TABLE_FULL
+    EXECUTE_TABLE_FULL,
+    EXECUTE_DUPLICATE_KEY
 }ExecuteResult;
 
 
@@ -504,12 +538,20 @@ PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement)
 //真正执行insert的逻辑
 ExecuteResult execute_insert(Statement* statement, Table* table){
     void* node = get_page(table->pager, table->root_page_num);
-    if((*leaf_node_num_cells(node) >= LEAF_NODE_MAX_CELLS)){
+    uint32_t num_cells = *leaf_node_num_cells(node);
+    if(num_cells >= LEAF_NODE_MAX_CELLS){
         return EXECUTE_TABLE_FULL;
     }
     Row* row_to_insert = &(statement->row_to_insert);
-    //创建出指向末尾的游标
-    Cursor* cursor = table_end(table);
+    uint32_t key_to_insert = row_to_insert->id;
+    Cursor* cursor = table_find(table, key_to_insert);
+    if(cursor->cell_num < num_cells){
+        uint32_t key_at_index = *leaf_node_key(node, cursor->cell_num);
+        if(key_at_index == key_to_insert){
+            free(cursor);
+            return EXECUTE_DUPLICATE_KEY;
+        }
+    }
     //把行数据序列化到这个位置
     leaf_node_insert(cursor, row_to_insert->id, row_to_insert);
     free(cursor);
@@ -596,6 +638,9 @@ int main(int argc, char *argv[]){
             case EXECUTE_SUCCESS:
                 printf("Executed.\n");
                 break;
+            case (EXECUTE_DUPLICATE_KEY):
+                printf("Error: Duplicate key.\n");
+                 break;
             case EXECUTE_TABLE_FULL:
                 printf("Error: Table full.\n");
                 break;
